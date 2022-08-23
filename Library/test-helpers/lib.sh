@@ -186,6 +186,30 @@ function limeUpdateConf() {
   local SED_OPTIONS=$4
   local FILES="/etc/keylime.conf /etc/keylime-agent.conf"
 
+  case $SECTION in
+    "cloud_verifier|revocations")
+      FILES="$FILES /etc/keylime/verifier.conf"
+      ;;
+    "cloud_agent")
+      FILES="$FILES /etc/keylime/agent.conf"
+      ;;
+    "tenant")
+      FILES="$FILES /etc/keylime/tenant.conf"
+      ;;
+    "registrar")
+      FILES="$FILES /etc/keylime/registrar.conf"
+      ;;
+    "ca")
+      FILES="$FILES /etc/keylime/ca.conf"
+      ;;
+    "logging")
+      FILES="$FILES /etc/keylime/logging.conf"
+      ;;
+    "*")
+      echo "Unknown section ${SECTION}"
+      ;;
+  esac
+
   for FILE in ${FILES}; do
     if [ -f ${FILE} ]; then
       # if the option exists, modify it
@@ -223,6 +247,13 @@ Returns 0 when the initialization was successfull, non-zero otherwise.
 limeBackupConfig() {
 
     rlFileBackup --clean --namespace limeConf --missing-ok /etc/keylime.conf /etc/keylime-agent.conf /etc/ima/ima-policy
+    rlFileBackup --clean --namespace limeConf --missing-ok \
+        /etc/keylime/agent.conf \
+        /etc/keylime/verifier.conf \
+        /etc/keylime/registrar.conf \
+        /etc/keylime/tenant.conf \
+        /etc/keylime/ca.conf \
+        /etc/keylime/logging.conf \
 
 }
 
