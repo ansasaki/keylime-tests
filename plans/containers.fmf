@@ -1,0 +1,18 @@
+summary:
+  Tests used by Packit/TFT CI on Github to test upstream keylime containers
+
+environment+:
+  TPM_BINARY_MEASUREMENTS: /var/tmp/binary_bios_measurements
+  REGISTRY: quay.io
+  VERIFIER_DOCKERFILE: Dockerfile.verifier
+  REGISTRAR_DOCKERFILE: Dockerfile.registrar
+  AGENT_DOCKERFILE: Dockerfile.agent
+
+discover:
+  how: fmf
+  test:
+   - /setup/configure_kernel_ima_module/ima_policy_simple
+   - keylime_verifier_registrar_container-basic-attestation
+
+execute:
+    how: tmt

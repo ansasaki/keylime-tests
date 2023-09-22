@@ -1,4 +1,4 @@
-FROM docker.io/redhat/ubi9:9.2
+FROM docker.io/redhat/ubi9:9.3
 COPY yumrepogen_setup.sh /root/yumrepogen_setup.sh
 RUN \
   chmod a+x /root/yumrepogen_setup.sh && /root/yumrepogen_setup.sh && \
