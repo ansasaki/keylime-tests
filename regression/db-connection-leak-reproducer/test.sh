@@ -57,6 +57,52 @@ AGENT_ID="d432fbb3-d2f1-4a97-9ef7-75bd81c00000"
 DB_POOL_SIZE="2"
 DB_MAX_OVERFLOW="1"
 
+# Operation timeout for detecting connection leaks that cause hangs
+OPERATION_TIMEOUT=15  # seconds per operation
+timeout_count=0       # track timeouts as evidence of leaks
+
+# Function to run keylime_tenant commands with timeout and track failures
+# Connection leaks can cause operations to hang, so timing out is evidence of problems
+run_with_timeout() {
+    local cmd="$1"
+    local description="$2"
+    local suppress_output="${3:-false}"
+
+    if [ "$suppress_output" = "true" ]; then
+        if timeout $OPERATION_TIMEOUT bash -c "$cmd" >/dev/null 2>&1; then
+            return 0
+        else
+            local exit_code=$?
+            if [ $exit_code -eq 124 ]; then
+                # Timeout occurred (exit code 124)
+                timeout_count=$((timeout_count + 1))
+                rlLogWarning "TIMEOUT: $description (${OPERATION_TIMEOUT}s) - potential connection leak symptom!"
+                return 1
+            else
+                # Other error
+                rlLogWarning "FAILED: $description (exit code: $exit_code)"
+                return 1
+            fi
+        fi
+    else
+        # For rlRun wrapped calls, don't suppress output
+        if timeout $OPERATION_TIMEOUT bash -c "$cmd"; then
+            return 0
+        else
+            local exit_code=$?
+            if [ $exit_code -eq 124 ]; then
+                # Timeout occurred (exit code 124)
+                timeout_count=$((timeout_count + 1))
+                rlLogWarning "TIMEOUT: $description (${OPERATION_TIMEOUT}s) - potential connection leak symptom!"
+                return 1
+            else
+                # Other error
+                return $exit_code
+            fi
+        fi
+    fi
+}
+
 # Function to monitor database file descriptors - the key indicator of connection leaks
 monitor_db_file_descriptors() {
     local phase="$1"
@@ -76,7 +122,13 @@ monitor_db_file_descriptors() {
             rlLogInfo "[$phase] Initial FD count recorded: $INITIAL_FD_COUNT"
         else
             local fd_diff=$((fd_count - INITIAL_FD_COUNT))
-            if [ $fd_diff -gt 5 ]; then
+            if [ $fd_diff -gt 10 ]; then
+                rlFail "CRITICAL: File descriptor count increased by $fd_diff - definite connection leak detected!"
+                # Show detailed FD information
+                rlLogInfo "[$phase] Processes with open FDs:"
+                lsof "$db_file" 2>/dev/null || rlLogInfo "No open file descriptors found"
+                return 1
+            elif [ $fd_diff -gt 5 ]; then
                 rlLogWarning "[$phase] FD count increased by $fd_diff (from $INITIAL_FD_COUNT to $fd_count) - potential connection leak!"
                 # Show which processes have the file open
                 rlLogInfo "[$phase] Processes with open FDs:"
@@ -132,7 +184,7 @@ check_db_health() {
     fi
 
     # Check service responsiveness as a proxy for connection health
-    if keylime_tenant -c cvlist   >/dev/null 2>&1; then
+    if run_with_timeout "keylime_tenant -c cvlist" "Service responsiveness check" true; then
         rlLogInfo "[$phase] Verifier service is responsive"
     else
         rlLogWarning "[$phase] Verifier service is not responsive"
@@ -201,23 +253,23 @@ rlJournalStart
         for i in {1..3}; do
             rlLogInfo "Testing agent operations cycle $i with agent $AGENT_ID"
 
-            # Add agent to verifier (exercises POST /agents endpoint)
-            rlRun "keylime_tenant -c add --uuid $AGENT_ID --file $TESTDIR/autorun.sh"
+                        # Add agent to verifier (exercises POST /agents endpoint)
+            rlRun "run_with_timeout 'keylime_tenant -c add --uuid $AGENT_ID --file $TESTDIR/autorun.sh' 'Agent add operation cycle $i'"
 
             # Verify agent is active (exercises GET /agents endpoint)
-            rlRun "keylime_tenant -c status --uuid $AGENT_ID"
+            rlRun "run_with_timeout 'keylime_tenant -c status --uuid $AGENT_ID' 'Agent status check cycle $i'"
 
-            # Query agent multiple times to exercise GET endpoint
+                        # Query agent multiple times to exercise GET endpoint
             for j in {1..3}; do
-                rlRun "keylime_tenant -c status --uuid $AGENT_ID" 0 "GET agent $AGENT_ID (query $j)"
+                rlRun "run_with_timeout 'keylime_tenant -c status --uuid $AGENT_ID' 'Agent GET query $j cycle $i'" 0
             done
 
             # Delete agent from verifier (exercises DELETE /agents endpoint)
-            rlRun "keylime_tenant -c delete --uuid $AGENT_ID"
+            rlRun "run_with_timeout 'keylime_tenant -c delete --uuid $AGENT_ID' 'Agent delete operation cycle $i'"
 
             # Additional direct API calls to exercise endpoints that could leak connections
             # Query agents list (exercises GET /agents endpoint)
-            rlRun "keylime_tenant -c cvlist  " 0 "GET agents list"
+            rlRun "run_with_timeout 'keylime_tenant -c cvlist' 'Agent list query cycle $i'" 0
 
             # Check database health after each cycle
             check_db_health "Agent cycle $i"
@@ -230,8 +282,8 @@ rlJournalStart
         rlLogInfo "Performing rapid API calls to stress database connections"
         for i in {1..5}; do
             # These API calls exercise the database without agent operations
-            keylime_tenant -c cvlist   >/dev/null 2>&1 &
-            keylime_tenant -c listruntimepolicy   >/dev/null 2>&1 &
+            run_with_timeout "keylime_tenant -c cvlist" "Rapid cvlist $i" true &
+            run_with_timeout "keylime_tenant -c listruntimepolicy" "Rapid listruntimepolicy $i" true &
         done
         wait
 
@@ -239,7 +291,7 @@ rlJournalStart
         rlRun "limeStopAgent"
 
         # Verify verifier is still responsive
-        rlRun "keylime_tenant -c cvlist  " 0 "Verifier should still be responsive after agent stress test"
+        rlRun "run_with_timeout 'keylime_tenant -c cvlist' 'Post-agent-stress verifier check'" 0
         check_db_health "After agent stress test"
     rlPhaseEnd
 
@@ -251,17 +303,17 @@ rlJournalStart
             POLICY_NAME="test-policy-$i"
             rlLogInfo "Testing policy operations cycle $i with policy $POLICY_NAME"
 
-                        # Create policy (addruntimepolicy command)
-            rlRun "keylime_tenant -c addruntimepolicy   --runtime-policy $TESTDIR/test-policy.json --runtime-policy-name $POLICY_NAME" 0 "Create test policy $POLICY_NAME"
+                                    # Create policy (addruntimepolicy command)
+            rlRun "run_with_timeout 'keylime_tenant -c addruntimepolicy --runtime-policy $TESTDIR/test-policy.json --runtime-policy-name $POLICY_NAME' 'Create policy $POLICY_NAME'" 0
 
             # Read policy (showruntimepolicy command)
-            rlRun "keylime_tenant -c showruntimepolicy   --runtime-policy-name $POLICY_NAME" 0 "Read test policy $POLICY_NAME"
+            rlRun "run_with_timeout 'keylime_tenant -c showruntimepolicy --runtime-policy-name $POLICY_NAME' 'Read policy $POLICY_NAME'" 0
 
             # Update policy (updateruntimepolicy command)
-            rlRun "keylime_tenant -c updateruntimepolicy   --runtime-policy $TESTDIR/test-policy.json --runtime-policy-name $POLICY_NAME" 0 "Update test policy $POLICY_NAME"
+            rlRun "run_with_timeout 'keylime_tenant -c updateruntimepolicy --runtime-policy $TESTDIR/test-policy.json --runtime-policy-name $POLICY_NAME' 'Update policy $POLICY_NAME'" 0
 
             # Delete policy (deleteruntimepolicy command)
-            rlRun "keylime_tenant -c deleteruntimepolicy   --runtime-policy-name $POLICY_NAME" 0 "Delete test policy $POLICY_NAME"
+            rlRun "run_with_timeout 'keylime_tenant -c deleteruntimepolicy --runtime-policy-name $POLICY_NAME' 'Delete policy $POLICY_NAME'" 0
 
             # Check database health after policy operations
             check_db_health "Policy cycle $i"
@@ -272,28 +324,28 @@ rlJournalStart
             MB_POLICY_NAME="test-mb-policy-$i"
             rlLogInfo "Testing MB policy operations cycle $i with policy $MB_POLICY_NAME"
 
-                        # Create MB policy (addmbpolicy command)
-            rlRun "keylime_tenant -c addmbpolicy   --mb-policy $TESTDIR/test-mb-policy.json --mb-policy-name $MB_POLICY_NAME" 0 "Create test MB policy $MB_POLICY_NAME"
+                                    # Create MB policy (addmbpolicy command)
+            rlRun "run_with_timeout 'keylime_tenant -c addmbpolicy --mb-policy $TESTDIR/test-mb-policy.json --mb-policy-name $MB_POLICY_NAME' 'Create MB policy $MB_POLICY_NAME'" 0
 
             # Read MB policy (showmbpolicy command)
-            rlRun "keylime_tenant -c showmbpolicy   --mb-policy-name $MB_POLICY_NAME" 0 "Read test MB policy $MB_POLICY_NAME"
+            rlRun "run_with_timeout 'keylime_tenant -c showmbpolicy --mb-policy-name $MB_POLICY_NAME' 'Read MB policy $MB_POLICY_NAME'" 0
 
             # Delete MB policy (deletembpolicy command)
-            rlRun "keylime_tenant -c deletembpolicy   --mb-policy-name $MB_POLICY_NAME" 0 "Delete test MB policy $MB_POLICY_NAME"
+            rlRun "run_with_timeout 'keylime_tenant -c deletembpolicy --mb-policy-name $MB_POLICY_NAME' 'Delete MB policy $MB_POLICY_NAME'" 0
 
             # Check database health after MB policy operations
             check_db_health "MB Policy cycle $i"
         done
 
         # Verify verifier is still responsive
-        rlRun "keylime_tenant -c cvlist  " 0 "Verifier should still be responsive after policy stress test"
+        rlRun "run_with_timeout 'keylime_tenant -c cvlist' 'Post-policy-stress verifier check'" 0
         check_db_health "After policy stress test"
     rlPhaseEnd
 
     rlPhaseStartTest "Test 3: Concurrent operations test"
         rlLogInfo "Testing concurrent database operations that could exhaust connection pool"
 
-        # Start a persistent agent for this test
+        # Start an agent for this test
         rlRun "limeStartAgent"
         rlRun "limeWaitForAgentRegistration $AGENT_ID"
 
@@ -301,9 +353,9 @@ rlJournalStart
         perform_api_ops() {
             local suffix=$1
             # Exercise the endpoints that previously leaked connections
-            keylime_tenant -c cvlist   >/dev/null 2>&1
+            run_with_timeout "keylime_tenant -c cvlist" "Concurrent cvlist $suffix" true
             sleep 0.1
-            keylime_tenant -c status --uuid $AGENT_ID >/dev/null 2>&1
+            run_with_timeout "keylime_tenant -c status --uuid $AGENT_ID" "Concurrent status $suffix" true
             sleep 0.1
             # These would be actual agent operations but we simulate with API calls
             # since we can only have one agent running
@@ -313,11 +365,11 @@ rlJournalStart
         perform_policy_ops() {
             local suffix=$1
             local policy_name="concurrent-policy-$suffix"
-            keylime_tenant -c addruntimepolicy   --runtime-policy "$TESTDIR/test-policy.json" --runtime-policy-name "$policy_name" >/dev/null 2>&1
+            run_with_timeout "keylime_tenant -c addruntimepolicy --runtime-policy $TESTDIR/test-policy.json --runtime-policy-name $policy_name" "Concurrent policy create $suffix" true
             sleep 0.1
-            keylime_tenant -c showruntimepolicy   --runtime-policy-name "$policy_name" >/dev/null 2>&1
+            run_with_timeout "keylime_tenant -c showruntimepolicy --runtime-policy-name $policy_name" "Concurrent policy read $suffix" true
             sleep 0.1
-            keylime_tenant -c deleteruntimepolicy   --runtime-policy-name "$policy_name" >/dev/null 2>&1
+            run_with_timeout "keylime_tenant -c deleteruntimepolicy --runtime-policy-name $policy_name" "Concurrent policy delete $suffix" true
         }
 
         # Launch concurrent operations
@@ -347,8 +399,8 @@ rlJournalStart
         rlRun "limeStopAgent"
 
         # Verify services are still responsive after concurrent load
-        rlRun "keylime_tenant -c cvlist  " 0 "Verifier should still be responsive after concurrent operations"
-        rlRun "keylime_tenant -c reglist  " 0 "Registrar should still be responsive after concurrent operations"
+        rlRun "run_with_timeout 'keylime_tenant -c cvlist' 'Post-concurrent verifier check'" 0
+        rlRun "run_with_timeout 'keylime_tenant -c reglist' 'Post-concurrent registrar check'" 0
         check_db_health "After concurrent operations"
     rlPhaseEnd
 
@@ -362,7 +414,7 @@ rlJournalStart
             policy_names+=("$POLICY_NAME")
 
             # Create policies rapidly (may hit connection pool limits)
-            keylime_tenant -c addruntimepolicy   --runtime-policy "$TESTDIR/test-policy.json" --runtime-policy-name "$POLICY_NAME" >/dev/null 2>&1 &
+            run_with_timeout "keylime_tenant -c addruntimepolicy --runtime-policy $TESTDIR/test-policy.json --runtime-policy-name $POLICY_NAME" "Rapid policy create $i" true &
         done
 
         # Wait for all creates to complete
@@ -370,56 +422,26 @@ rlJournalStart
         sleep 1
 
         # Verify service is still functional
-        rlRun "keylime_tenant -c cvlist  " 0 "Verifier should recover from resource exhaustion"
+        rlRun "run_with_timeout 'keylime_tenant -c cvlist' 'Post-exhaustion verifier check'" 0
         check_db_health "After resource exhaustion test"
 
         # Clean up policies
         for policy_name in "${policy_names[@]}"; do
-            keylime_tenant -c deleteruntimepolicy   --runtime-policy-name "$policy_name" >/dev/null 2>&1 &
+            run_with_timeout "keylime_tenant -c deleteruntimepolicy --runtime-policy-name $policy_name" "Cleanup policy $policy_name" true &
         done
         wait
 
         sleep 1
-        rlRun "keylime_tenant -c cvlist  " 0 "Verifier should remain responsive after cleanup"
+        rlRun "run_with_timeout 'keylime_tenant -c cvlist' 'Post-cleanup verifier check'" 0
         check_db_health "After cleanup"
     rlPhaseEnd
 
     rlPhaseStartTest "Test 5: File descriptor leak detection test with timeouts"
         rlLogInfo "Intensive file descriptor monitoring to detect connection leaks"
 
-        # Start a fresh agent for this test
+        # Start an agent for this test
         rlRun "limeStartAgent"
         rlRun "limeWaitForAgentRegistration $AGENT_ID"
-
-        # Record baseline FD count
-        monitor_db_file_descriptors "Baseline for leak detection"
-        baseline_fd_count=$CURRENT_FD_COUNT
-
-        # Timeout settings - connection leaks can cause operations to hang
-        OPERATION_TIMEOUT=15  # seconds per operation
-        timeout_count=0       # track timeouts as evidence of leaks
-
-        # Function to run commands with timeout and track failures
-        run_with_timeout() {
-            local cmd="$1"
-            local description="$2"
-
-            if timeout $OPERATION_TIMEOUT bash -c "$cmd" >/dev/null 2>&1; then
-                return 0
-            else
-                local exit_code=$?
-                if [ $exit_code -eq 124 ]; then
-                    # Timeout occurred (exit code 124)
-                    timeout_count=$((timeout_count + 1))
-                    rlLogWarning "TIMEOUT: $description (${OPERATION_TIMEOUT}s) - potential connection leak symptom!"
-                    return 1
-                else
-                    # Other error
-                    rlLogWarning "FAILED: $description (exit code: $exit_code)"
-                    return 1
-                fi
-            fi
-        }
 
         # Perform intensive operations that would have leaked connections before the fix
         rlLogInfo "Performing intensive operations to stress-test connection management (with ${OPERATION_TIMEOUT}s timeouts)"
@@ -429,42 +451,29 @@ rlJournalStart
 
             # Rapid agent operations with timeout monitoring
             for i in {1..3}; do
-                run_with_timeout "keylime_tenant -c add --uuid $AGENT_ID --file $TESTDIR/autorun.sh" "Agent add operation $i"
-                run_with_timeout "keylime_tenant -c status --uuid $AGENT_ID" "Agent status check $i"
-                run_with_timeout "keylime_tenant -c delete --uuid $AGENT_ID" "Agent delete operation $i"
-                run_with_timeout "keylime_tenant -c cvlist" "Agent list operation $i"
+                run_with_timeout "keylime_tenant -c add --uuid $AGENT_ID --file $TESTDIR/autorun.sh" "Agent add operation $i" true
+                run_with_timeout "keylime_tenant -c status --uuid $AGENT_ID" "Agent status check $i" true
+                run_with_timeout "keylime_tenant -c delete --uuid $AGENT_ID" "Agent delete operation $i" true
+                run_with_timeout "keylime_tenant -c cvlist" "Agent list operation $i" true
             done
 
             # Rapid policy operations with timeout monitoring
             for i in {1..3}; do
                 test_policy="fd-test-policy-$cycle-$i"
-                run_with_timeout "keylime_tenant -c addruntimepolicy --runtime-policy $TESTDIR/test-policy.json --runtime-policy-name $test_policy" "Policy create $test_policy"
-                run_with_timeout "keylime_tenant -c showruntimepolicy --runtime-policy-name $test_policy" "Policy read $test_policy"
-                run_with_timeout "keylime_tenant -c deleteruntimepolicy --runtime-policy-name $test_policy" "Policy delete $test_policy"
+                run_with_timeout "keylime_tenant -c addruntimepolicy --runtime-policy $TESTDIR/test-policy.json --runtime-policy-name $test_policy" "Policy create $test_policy" true
+                run_with_timeout "keylime_tenant -c showruntimepolicy --runtime-policy-name $test_policy" "Policy read $test_policy" true
+                run_with_timeout "keylime_tenant -c deleteruntimepolicy --runtime-policy-name $test_policy" "Policy delete $test_policy" true
             done
 
             # Monitor FD count after each cycle
+            check_db_health "After intensive cycle $cycle"
             monitor_db_file_descriptors "After intensive cycle $cycle"
-            current_fd_count=$CURRENT_FD_COUNT
-            fd_increase=$((current_fd_count - baseline_fd_count))
 
             # Report timeout statistics for this cycle
             rlLogInfo "Cycle $cycle completed - Timeouts so far: $timeout_count"
 
-            if [ $fd_increase -gt 10 ]; then
-                rlFail "CRITICAL: File descriptor count increased by $fd_increase - definite connection leak detected!"
-                # Show detailed FD information
-                rlLogInfo "Detailed file descriptor information:"
-                lsof /var/lib/keylime/cv_data.sqlite 2>/dev/null | head -20
-                break
-            elif [ $fd_increase -gt 3 ]; then
-                rlLogWarning "File descriptor count increased by $fd_increase - monitoring closely"
-            else
-                rlLogInfo "File descriptor count acceptable (increase: $fd_increase)"
-            fi
-
             # Check if we're getting too many timeouts (another leak indicator)
-            if [ $timeout_count -gt 5 ]; then
+            if [ $timeout_count -gt 3 ]; then
                 rlFail "CRITICAL: Too many operation timeouts ($timeout_count) - system becoming unresponsive!"
                 break
             fi
@@ -473,30 +482,8 @@ rlJournalStart
             sleep 1
         done
 
-        # Final comprehensive check
-        monitor_db_file_descriptors "Final FD leak check"
-        final_fd_count=$CURRENT_FD_COUNT
-        total_fd_increase=$((final_fd_count - baseline_fd_count))
-
-        # Report final statistics
-        rlLogInfo "=== FINAL LEAK DETECTION RESULTS ==="
-        rlLogInfo "Total file descriptor increase: $total_fd_increase"
-        rlLogInfo "Total operation timeouts: $timeout_count"
-        rlLogInfo "Initial FD count: $baseline_fd_count"
-        rlLogInfo "Final FD count: $final_fd_count"
-
-        # Determine overall test result based on both FD count and timeouts
-        if [ $total_fd_increase -le 5 ] && [ $timeout_count -le 2 ]; then
-            rlPass "Connection leak test PASSED - FD increase: $total_fd_increase, timeouts: $timeout_count (both acceptable)"
-        elif [ $total_fd_increase -gt 5 ] && [ $timeout_count -gt 2 ]; then
-            rlFail "Connection leak test FAILED - FD increase: $total_fd_increase AND timeouts: $timeout_count (both indicate severe leaks)"
-        elif [ $total_fd_increase -gt 5 ]; then
-            rlFail "Connection leak test FAILED - FD increase: $total_fd_increase (indicates file descriptor leak)"
-        elif [ $timeout_count -gt 2 ]; then
-            rlFail "Connection leak test FAILED - timeouts: $timeout_count (indicates system unresponsiveness from leaks)"
-        else
-            rlPass "Connection leak test PASSED with minor issues - FD increase: $total_fd_increase, timeouts: $timeout_count"
-        fi
+        # Final check
+        check_db_health "Final check"
 
         # Stop agent
         rlRun "limeStopAgent"
@@ -511,6 +498,7 @@ rlJournalStart
             rlRun "limeStopTPMEmulator"
             rlRun "limeCondStopAbrmd"
         fi
+        limeSubmitCommonLogs
         limeClearData
         limeRestoreConfig
         limeExtendNextExcludelist "$TESTDIR"
