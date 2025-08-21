@@ -1,0 +1,35 @@
+summary: Test keylime handling of malformed EK certificates
+description: |
+    This regression test verifies keylime's behavior when encountering EK certificates
+    that violate ASN.1 DER encoding rules.
+
+    The test uses swtpm_setup with a custom certificate creation script that leverages
+    swtpm_cert to generate:
+    - A platform certificate with properly sorted DN components (ASN.1 compliant)
+    - An EK certificate with malformed DN where components are not sorted (CN, O, C instead of C, O, CN)
+
+    Test phases:
+    1. Setup custom swtpm with malformed EK certificate using swtpm_cert
+    2. Verify that default keylime EK certificate verification fails due to malformed DN
+    3. Configure keylime to use custom EK check script that uses OpenSSL validation
+    4. Verify that custom script allows the malformed certificate to pass verification
+
+    This test ensures that keylime can handle real-world TPM certificates that may not
+    strictly conform to ASN.1 DER encoding rules when using custom verification scripts.
+contact: Anderson Toshiyuki Sasaki <ansasaki@redhat.com>
+component:
+  - keylime
+test: ./test.sh
+framework: beakerlib
+tag:
+  - regression
+require:
+  - keylime
+  - openssl
+  - swtpm
+  - swtpm-tools
+  - tpm2-tools
+  - yum
+duration: 10m
+enabled: true
+id: 76b080c9-61a6-4705-8eb0-00cc636d66d4
